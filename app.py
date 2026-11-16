@@ -1,6 +1,7 @@
 """Streamlit dashboard for SweatPals ticket sales analytics. Run: streamlit run app.py"""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -257,6 +258,140 @@ def render_capacity_admin(tickets):
         st.dataframe(df, hide_index=True, use_container_width=True)
 
 
+OPEX_SNAPSHOT = Path(__file__).parent / "data" / "quickbooks_opex.json"
+
+
+def load_opex() -> dict:
+    """Operating expenses snapshotted from QuickBooks.
+
+    Deliberately gitignored and read only here, in the local app. The published dashboard
+    is a public page on a public repo, so OTT's cost structure must not reach it.
+    """
+    try:
+        with open(OPEX_SNAPSHOT, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def monthly_ticket_revenue(tickets: pd.DataFrame) -> pd.DataFrame:
+    """Ticket revenue per calendar month, counted when the ticket was SOLD."""
+    t = tickets.dropna(subset=["order_date"]).copy()
+    t["month"] = (t["order_date"].dt.tz_convert("US/Pacific")
+                                 .dt.tz_localize(None).dt.to_period("M"))
+    by_month = (t.groupby("month", as_index=False)
+                 .agg(revenue=("net_price", "sum"), tickets=("id", "count")))
+    if by_month.empty:
+        return by_month
+    span = pd.period_range(by_month["month"].min(), by_month["month"].max(), freq="M")
+    return (by_month.set_index("month").reindex(span, fill_value=0)
+                    .rename_axis("month").reset_index())
+
+
+def render_cost_coverage(tickets):
+    st.subheader("Cost coverage — do ticket sales cover the overhead?")
+
+    snap = load_opex()
+    if not snap:
+        st.info(
+            "No QuickBooks snapshot found at `data/quickbooks_opex.json`.\n\n"
+            "Ask Claude to pull a fresh one from the QuickBooks connector. The file is "
+            "gitignored on purpose, so it stays on this machine."
+        )
+        return
+
+    st.caption(
+        f"Operating expenses from {snap.get('source', 'QuickBooks')} — "
+        "cost of goods sold (event production) excluded. "
+        f"Snapshot pulled {snap.get('pulled_at', '?')[:10]}. "
+        "**Local only — this never reaches the public dashboard.**"
+    )
+
+    rev = monthly_ticket_revenue(tickets)
+    if rev.empty:
+        st.warning("No ticket sales yet.")
+        return
+
+    opex_map = snap.get("opex_by_month", {})
+    rev["opex"] = [opex_map.get(m.strftime("%Y-%m")) for m in rev["month"]]
+    rev["gap"] = rev["revenue"] - rev["opex"]
+    this_month = pd.Timestamp.now(tz="US/Pacific").to_period("M")
+    rev["partial"] = rev["month"] == this_month
+
+    complete = rev[~rev["partial"] & rev["opex"].notna()]
+    if not complete.empty:
+        last = complete.iloc[-1]
+        c1, c2, c3 = st.columns(3)
+        c1.metric(f"Ticket revenue — {last['month'].strftime('%b %Y')}", fmt_money(last["revenue"]))
+        c2.metric("Operating costs", fmt_money(last["opex"]))
+        c3.metric("Covered by", fmt_money(last["gap"]),
+                  delta="covered" if last["gap"] >= 0 else "short",
+                  delta_color="normal" if last["gap"] >= 0 else "inverse")
+
+        months_covered = int((complete["gap"] >= 0).sum())
+        st.caption(
+            f"Ticket sales covered overhead in **{months_covered} of {len(complete)}** "
+            "complete months on record."
+        )
+
+    labels = [m.strftime("%b %Y") for m in rev["month"]]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=labels, y=rev["revenue"], name="Ticket revenue",
+        marker=dict(
+            color="#6366f1",
+            pattern=dict(shape=["/" if p else "" for p in rev["partial"]],
+                         fgcolor="#ffffff", size=5, solidity=0.28),
+        ),
+        hovertemplate="<b>%{x}</b><br>Ticket revenue %{y:$,.0f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=labels, y=rev["opex"], name="Operating costs",
+        mode="lines+markers", line=dict(color="#d97706", width=2),
+        marker=dict(size=8, color="#d97706"), connectgaps=False,
+        hovertemplate="<b>%{x}</b><br>Operating costs %{y:$,.0f}<extra></extra>",
+    ))
+    fig.update_layout(
+        height=380, barcornerradius=4, bargap=0.3,
+        margin=dict(l=10, r=10, t=30, b=10),
+        paper_bgcolor="white", plot_bgcolor="#f8fafc",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        xaxis=dict(showgrid=False, tickangle=-45),
+        yaxis=dict(gridcolor="#e2e8f0", zerolinecolor="#e2e8f0",
+                   tickprefix="$", tickformat="~s"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    if rev["partial"].any():
+        st.caption(f"Hatched bar is {this_month.strftime('%B')} so far (month to date).")
+
+    table = rev[rev["opex"].notna()].copy()
+    table["Month"] = [m.strftime("%b %Y") for m in table["month"]]
+    table["Covered?"] = ["yes" if g >= 0 else "no" for g in table["gap"]]
+    st.dataframe(
+        table[["Month", "revenue", "opex", "gap", "Covered?"]]
+        .rename(columns={"revenue": "Ticket revenue", "opex": "Operating costs",
+                         "gap": "Surplus / shortfall"})
+        .style.format({"Ticket revenue": "${:,.0f}", "Operating costs": "${:,.0f}",
+                       "Surplus / shortfall": "${:,.0f}"}),
+        use_container_width=True, hide_index=True,
+    )
+
+    accts = snap.get("expense_accounts_latest_month") or {}
+    if accts:
+        with st.expander("What's in 'operating costs'?"):
+            st.caption("Most recent month in the snapshot, by QuickBooks account.")
+            st.dataframe(
+                pd.DataFrame(sorted(accts.items(), key=lambda kv: -kv[1]),
+                             columns=["Account", "Amount"])
+                  .style.format({"Amount": "${:,.2f}"}),
+                use_container_width=True, hide_index=True,
+            )
+        st.caption(
+            "If any of these are really event costs, reclassify them to COGS in "
+            "QuickBooks and re-pull — this view trusts QuickBooks' own split."
+        )
+
+
 def main():
     st.title("OTT Ticketing Dashboard")
     tickets, capacities, waitlist = get_data()
@@ -278,16 +413,19 @@ def main():
             get_data.clear()
             st.rerun()
 
-    tabs = st.tabs(["Pipeline health", "Event detail", "Portfolio", "Velocity", "Capacity config"])
+    tabs = st.tabs(["Pipeline health", "Cost coverage", "Event detail", "Portfolio",
+                     "Velocity", "Capacity config"])
     with tabs[0]:
         render_pipeline_health(tickets, capacities, waitlist)
     with tabs[1]:
-        render_event_detail(tickets, capacities, waitlist)
+        render_cost_coverage(tickets)
     with tabs[2]:
-        render_portfolio(tickets)
+        render_event_detail(tickets, capacities, waitlist)
     with tabs[3]:
-        render_velocity(tickets)
+        render_portfolio(tickets)
     with tabs[4]:
+        render_velocity(tickets)
+    with tabs[5]:
         render_capacity_admin(tickets)
 
 

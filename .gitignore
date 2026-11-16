@@ -7,3 +7,6 @@ data/*.db
 data/*.parquet
 dist/
 .DS_Store
+
+# QuickBooks financials — local only, must never reach the public repo/dashboard
+data/quickbooks_opex.json

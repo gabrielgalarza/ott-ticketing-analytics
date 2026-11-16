@@ -260,6 +260,91 @@ def build_day_of_week_charts(tickets: pd.DataFrame) -> str:
     <p class="caption">Left: which event-days draw the biggest crowds — informs new-event scheduling. Right: which days customers actually buy — informs ad spend timing and posting cadence.</p>"""
 
 
+def build_monthly_revenue_chart(tickets: pd.DataFrame, months: int = 13) -> str:
+    """Month-over-month ticket revenue, counted when the ticket was SOLD.
+
+    Sale date, not event date: this answers "how much money came in each month", so a
+    Blend in March that sold out in January is January revenue. Event-date revenue is a
+    different question and already lives in the per-event tables below.
+    """
+    if tickets.empty or tickets["order_date"].isna().all():
+        return "<div class='chart-box'><p class='empty'>No ticket sales yet.</p></div>"
+
+    t = tickets.dropna(subset=["order_date"]).copy()
+    # tz_localize(None) first: to_period on a tz-aware series warns about dropping the tz
+    t["month"] = t["order_date"].dt.tz_convert("US/Pacific").dt.tz_localize(None).dt.to_period("M")
+    by_month = (t.groupby("month", as_index=False)
+                 .agg(revenue=("net_price", "sum"), tickets=("id", "count")))
+    if by_month.empty:
+        return "<div class='chart-box'><p class='empty'>No ticket sales yet.</p></div>"
+
+    # A month with no sales is a real zero, not a gap — reindex so the axis stays continuous
+    span = pd.period_range(by_month["month"].min(), by_month["month"].max(), freq="M")
+    by_month = (by_month.set_index("month").reindex(span, fill_value=0)
+                        .rename_axis("month").reset_index().tail(months))
+
+    this_month = pd.Timestamp.now(tz="US/Pacific").to_period("M")
+    is_partial = by_month["month"] == this_month
+    labels = [m.strftime("%b %Y") for m in by_month["month"]]
+
+    # Single series, so no legend — the title names it. The in-progress month is set apart
+    # by a hatch AND an explicit label, never by colour alone.
+    fig = go.Figure(go.Bar(
+        x=labels,
+        y=by_month["revenue"],
+        marker=dict(
+            color="#6366f1",
+            pattern=dict(
+                shape=["/" if p else "" for p in is_partial],
+                fgcolor="#ffffff", size=5, solidity=0.28,
+            ),
+        ),
+        customdata=by_month[["tickets"]].to_numpy(),
+        hovertemplate="<b>%{x}</b><br>%{y:$,.0f}<br>%{customdata[0]:,} tickets<extra></extra>",
+        # Direct-label only the latest bar rather than every one
+        text=["" for _ in range(len(by_month) - 1)] + [money(by_month["revenue"].iloc[-1])],
+        textposition="outside",
+        textfont=dict(color="#475569", size=12),
+        cliponaxis=False,
+    ))
+    fig.update_layout(
+        height=300,
+        barcornerradius=4,
+        bargap=0.3,
+        showlegend=False,
+        xaxis=dict(showgrid=False, tickangle=-45 if len(by_month) > 8 else 0),
+        yaxis=dict(title=None, gridcolor="#e2e8f0", zerolinecolor="#e2e8f0",
+                   tickprefix="$", tickformat="~s"),
+        **CHART_LAYOUT,
+    )
+
+    # Headline: the last COMPLETE month, so a half-finished month never reads as a crash
+    complete = by_month[~is_partial]
+    head = ""
+    if not complete.empty:
+        last = complete.iloc[-1]
+        head = (f"<div><span class='mom-value'>{money(last['revenue'])}</span>"
+                f"<span class='mom-label'>{last['month'].strftime('%B %Y')} · "
+                f"{int(last['tickets']):,} tickets</span></div>")
+        if len(complete) >= 2:
+            prev = complete.iloc[-2]
+            if prev["revenue"] > 0:
+                pct = (last["revenue"] - prev["revenue"]) / prev["revenue"] * 100
+                up = pct >= 0
+                head += (f"<div class='mom-delta {'up' if up else 'down'}'>"
+                         f"{'▲' if up else '▼'} {abs(pct):,.0f}% vs {prev['month'].strftime('%B')}</div>")
+            else:
+                head += "<div class='mom-delta flat'>— no sales the month before</div>"
+
+    partial_note = ""
+    if is_partial.any():
+        partial_note = ("<div class='mom-note'>Hatched bar is "
+                        f"{this_month.strftime('%B')} so far (month to date).</div>")
+
+    return (f"<div class='chart-box'><div class='mom-head'>{head}</div>"
+            f"{_chart(fig)}{partial_note}</div>")
+
+
 def build_top_events_chart(tickets: pd.DataFrame) -> str:
     by_event = (
         tickets.groupby("event_name", as_index=False)
@@ -1263,6 +1348,7 @@ def render(built_iso: str | None = None) -> str:
         </tr>"""
 
     top_html = build_top_events_chart(tickets)
+    monthly_revenue_html = build_monthly_revenue_chart(tickets)
     dow_html = build_day_of_week_charts(tickets)
     marketing_efficiency_html = build_marketing_efficiency_table(marketing_table)
     marketing_pace_html = build_marketing_pace_chart(tickets, attributed_ads)
@@ -1405,6 +1491,15 @@ def render(built_iso: str | None = None) -> str:
                    border: 1px solid #fecaca; border-left: 4px solid #dc2626; border-radius: 8px;
                    color: #991b1b; font-size: 13px; line-height: 1.55; }}
   .stale-banner a {{ color: #991b1b; font-weight: 700; }}
+  .mom-head {{ display: flex; align-items: baseline; justify-content: space-between;
+               gap: 16px; flex-wrap: wrap; margin: 2px 4px 10px; }}
+  .mom-value {{ font-size: 30px; font-weight: 700; color: #0f172a; letter-spacing: -.02em; }}
+  .mom-label {{ font-size: 12.5px; color: #64748b; margin-left: 10px; }}
+  .mom-delta {{ font-size: 13px; font-weight: 700; padding: 3px 10px; border-radius: 999px; }}
+  .mom-delta.up {{ color: #15803d; background: #f0fdf4; }}
+  .mom-delta.down {{ color: #b91c1c; background: #fef2f2; }}
+  .mom-delta.flat {{ color: #64748b; background: #f1f5f9; }}
+  .mom-note {{ font-size: 11.5px; color: #94a3b8; margin: 6px 4px 0; }}
   .empty {{ color: #94a3b8; font-style: italic; }}
   footer {{ max-width: 1200px; margin: 0 auto; padding: 0 40px 40px;
             color: #94a3b8; font-size: 12px; }}
@@ -1436,6 +1531,9 @@ def render(built_iso: str | None = None) -> str:
        target="_blank" rel="noopener">open GitHub Actions</a> and click "Run workflow" to refresh.
   </div>
   <div class="cards">{cards_html}</div>
+
+  <h2>Ticket revenue by month</h2>
+  {monthly_revenue_html}
 
   {recommendations_html}
 

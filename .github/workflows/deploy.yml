@@ -9,22 +9,21 @@ on:
     paths-ignore:
       - "README.md"
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
 concurrency:
   group: pages
   cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # the keep-alive commit below needs write
+      pages: write
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -45,21 +44,53 @@ jobs:
           WINDSOR_API_KEY: ${{ secrets.WINDSOR_API_KEY }}
         run: python scripts/refresh_marketing_data.py
 
+      - name: Commit refreshed snapshots (keeps the cron alive)
+        # GitHub disables `schedule:` triggers after 60 days with no repo activity. That silently
+        # froze this dashboard for ~2.5 weeks in Nov 2026 — the page still served 200, just with
+        # month-old numbers. Committing the snapshots this run already regenerated counts as
+        # activity, so the schedule never expires. Pushes made with GITHUB_TOKEN do not trigger
+        # workflows, so this cannot loop. Non-fatal: a failure here must not block the deploy.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          msg="Refresh marketing + social snapshots [skip ci]"
+          if git diff --cached --quiet; then
+            # Nothing changed upstream. Only force a commit if the repo is drifting toward the
+            # 60-day cutoff, so we get at most one heartbeat a month instead of 4 commits a day.
+            age_days=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+            echo "No snapshot changes; last commit was ${age_days}d ago."
+            if [ "$age_days" -lt 30 ]; then
+              echo "Under 30d — nothing to do."
+              exit 0
+            fi
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > data/.heartbeat
+            git add data/.heartbeat
+            msg="Keep-alive heartbeat so the deploy schedule does not expire [skip ci]"
+          fi
+          git commit -m "$msg"
+          git push
+
       - name: Build static dashboard
         run: python -m src.build_static
 
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v6
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: dist
 
   deploy:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

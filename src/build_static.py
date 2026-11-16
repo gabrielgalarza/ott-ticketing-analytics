@@ -8,6 +8,8 @@ Run: python -m src.build_static
 from __future__ import annotations
 
 import colorsys
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -64,6 +66,105 @@ _GOLDEN_ANGLE = 137.508  # spreads hues so adjacent indices land far apart on th
 def _hsl_hex(hue: float, sat: float, light: float) -> str:
     r, g, b = colorsys.hls_to_rgb((hue % 360) / 360, light, sat)
     return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
+
+
+# Client-side refresh logic. Kept out of the f-string template so the braces don't
+# need doubling; referenced below as {REFRESH_SCRIPT}.
+REFRESH_SCRIPT = """<script>
+// The page is static, so "refresh" means: is there a newer build on the CDN? If yes, load it.
+// If not, and a dispatch proxy is configured, ask it to rebuild and watch for the result.
+(function () {
+  var btn = document.getElementById("refresh-btn");
+  var hint = document.getElementById("refresh-hint");
+  if (!btn) return;
+
+  var PAGE_BUILT = new Date(btn.getAttribute("data-built")).getTime();
+  var PROXY = btn.getAttribute("data-proxy") || "";
+  var ACTIONS = btn.getAttribute("data-actions");
+  var POLL_MS = 10000;
+  var MAX_WAIT_MS = 12 * 60 * 1000;
+
+  function setHint(html) { if (hint) hint.innerHTML = html; }
+  function busy(on, label) {
+    btn.disabled = on;
+    btn.textContent = label || "\u21bb Refresh data";
+  }
+  function loadFresh() { location.replace(location.pathname + "?v=" + Date.now()); }
+  function actionsLink(text) {
+    return '<a href="' + ACTIONS + '" target="_blank" rel="noopener">' + text + "</a>";
+  }
+  function fetchBuild() {
+    return fetch("build.json?t=" + Date.now(), { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; });
+  }
+  function isNewer(info) {
+    // 1s of slack so clock jitter between build and page never reads as "newer"
+    return !!(info && info.built && new Date(info.built).getTime() > PAGE_BUILT + 1000);
+  }
+  function ago(ms) {
+    var m = Math.round(ms / 60000);
+    if (m < 1) return "just now";
+    if (m < 60) return m + " min ago";
+    var h = Math.round(m / 60);
+    return h + (h === 1 ? " hour ago" : " hours ago");
+  }
+
+  function waitForBuild() {
+    var t0 = Date.now();
+    (function poll() {
+      setTimeout(function () {
+        fetchBuild().then(function (info) {
+          if (isNewer(info)) {
+            setHint("New data is live \u2014 reloading\u2026");
+            return loadFresh();
+          }
+          var waited = Date.now() - t0;
+          if (waited > MAX_WAIT_MS) {
+            busy(false);
+            setHint("Still building. Reload shortly, or " + actionsLink("check Actions \u2197"));
+            return;
+          }
+          var s = Math.floor(waited / 1000);
+          busy(true, "\u21bb Rebuilding\u2026 " + Math.floor(s / 60) + ":" + ("0" + (s % 60)).slice(-2));
+          poll();
+        });
+      }, POLL_MS);
+    })();
+  }
+
+  btn.addEventListener("click", function () {
+    busy(true, "\u21bb Checking\u2026");
+    setHint("Checking for a newer build\u2026");
+    fetchBuild().then(function (info) {
+      if (isNewer(info)) {
+        setHint("New data found \u2014 reloading\u2026");
+        return loadFresh();
+      }
+      if (!PROXY) {
+        busy(false);
+        setHint("Already current (synced " + ago(Date.now() - PAGE_BUILT) + "). " +
+                actionsLink("Force a rebuild \u2197"));
+        return;
+      }
+      busy(true, "\u21bb Starting\u2026");
+      setHint("Pulling fresh data from SweatPals + Windsor\u2026 2\u20136 min.");
+      fetch(PROXY, { method: "POST" }).then(function (r) {
+        if (r.ok) { waitForBuild(); return; }
+        if (r.status === 429) {           // a build is already running
+          setHint("A rebuild is already running \u2014 watching for it\u2026");
+          waitForBuild();
+          return;
+        }
+        throw new Error("proxy " + r.status);
+      }).catch(function () {
+        busy(false);
+        setHint("Could not start a rebuild. " + actionsLink("Run it on GitHub \u2197"));
+      });
+    });
+  });
+})();
+</script>"""
 
 
 def build_event_color_map(tickets: pd.DataFrame) -> dict[str, float]:
@@ -969,6 +1070,9 @@ def render() -> str:
     updated = pd.Timestamp.now(tz="US/Pacific").strftime("%B %d, %Y at %-I:%M %p PT")
     # ISO timestamp for the client-side staleness banner (the page cannot know "now" at build time)
     built_iso = pd.Timestamp.now(tz="UTC").isoformat()
+    # Set as a repo variable so the button can trigger a rebuild; absent is fine, the
+    # button then just checks for a newer build and links to Actions for a forced one.
+    proxy_url = os.environ.get("REFRESH_PROXY_URL", "").strip()
 
     if tickets.empty:
         return f"<html><body><h1>OTT Ticketing Dashboard</h1><p>No data yet. Updated {updated}.</p></body></html>"
@@ -1166,6 +1270,8 @@ def render() -> str:
     recommendations_html = build_recommendations_banner(summary, marketing_table, attributed_ads, attributed_posts, tickets)
 
     paid_n, free_n = rates.get("paid_n", 0), rates.get("free_n", 0)
+    refresh_hint = ("Pulls fresh data · rebuild takes 2–6 min" if proxy_url
+                    else "Checks for a newer build · hourly auto-refresh")
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1186,7 +1292,10 @@ def render() -> str:
   header .refresh-btn {{ display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px;
                          background: #6366f1; color: #fff; border-radius: 8px; font-size: 13px;
                          font-weight: 600; text-decoration: none; transition: background .15s; }}
-  header .refresh-btn:hover {{ background: #4f46e5; }}
+  header .refresh-btn {{ border: none; cursor: pointer; font-family: inherit; }}
+  header .refresh-btn:hover:not(:disabled) {{ background: #4f46e5; }}
+  header .refresh-btn:disabled {{ opacity: .65; cursor: default; }}
+  header .refresh-hint a {{ color: #818cf8; font-weight: 600; }}
   header .refresh-hint {{ color: #64748b; font-size: 11px; margin-top: 4px; text-align: right; }}
   main {{ max-width: 1200px; margin: 0 auto; padding: 28px 40px 60px; }}
   h2 {{ font-size: 17px; margin: 36px 0 14px; color: #0f172a;
@@ -1307,11 +1416,12 @@ def render() -> str:
       <div class="updated">Auto-updated {updated} &nbsp;·&nbsp; data from SweatPals</div>
     </div>
     <div style="text-align:right">
-      <a class="refresh-btn" href="https://github.com/gabrielgalarza/ott-ticketing-analytics/actions/workflows/deploy.yml"
-         target="_blank" rel="noopener" title="Opens GitHub Actions — click 'Run workflow' there to trigger a fresh sync + rebuild (~4 min)">
+      <button class="refresh-btn" id="refresh-btn" type="button"
+              data-built="{built_iso}" data-proxy="{proxy_url}"
+              data-actions="https://github.com/gabrielgalarza/ott-ticketing-analytics/actions/workflows/deploy.yml">
         ↻ Refresh data
-      </a>
-      <div class="refresh-hint">Opens GitHub · click "Run workflow" · ~4 min to redeploy</div>
+      </button>
+      <div class="refresh-hint" id="refresh-hint">{refresh_hint}</div>
     </div>
   </div>
 </header>
@@ -1395,6 +1505,7 @@ def render() -> str:
     <tbody>{past_rows if past_rows else '<tr><td colspan=7 class=empty>No past events.</td></tr>'}</tbody>
   </table>
 </main>
+{REFRESH_SCRIPT}
 <script>
 // Show the stale banner when the page is more than 12h old (the cron runs every 6h, so
 // 12h means at least two builds were missed).
@@ -1426,6 +1537,11 @@ def main() -> None:
     (DIST / "index.html").write_text(html, encoding="utf-8")
     # .nojekyll keeps GitHub Pages from running Jekyll on the artifact
     (DIST / ".nojekyll").write_text("", encoding="utf-8")
+    # Tiny manifest the page polls to detect a newer deploy without hitting the GitHub API
+    (DIST / "build.json").write_text(json.dumps({
+        "built": pd.Timestamp.now(tz="UTC").isoformat(),
+        "commit": os.environ.get("GITHUB_SHA", "local")[:7],
+    }), encoding="utf-8")
     print(f"Wrote {DIST / 'index.html'} ({len(html):,} bytes)")
 
 

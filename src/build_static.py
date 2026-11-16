@@ -1054,7 +1054,7 @@ def build_event_curve(tickets: pd.DataFrame, row: pd.Series,
     return _chart(fig)
 
 
-def render() -> str:
+def render(built_iso: str | None = None) -> str:
     tickets = load_tickets()
     capacities = load_capacities()
     waitlist = load_waitlist()
@@ -1069,7 +1069,9 @@ def render() -> str:
 
     updated = pd.Timestamp.now(tz="US/Pacific").strftime("%B %d, %Y at %-I:%M %p PT")
     # ISO timestamp for the client-side staleness banner (the page cannot know "now" at build time)
-    built_iso = pd.Timestamp.now(tz="UTC").isoformat()
+    # Must match build.json exactly — the page compares the two to decide whether a newer
+    # build is live, so a couple of seconds of drift reads as "newer" on every click.
+    built_iso = built_iso or pd.Timestamp.now(tz="UTC").isoformat()
     # Set as a repo variable so the button can trigger a rebuild; absent is fine, the
     # button then just checks for a newer build and links to Actions for a forced one.
     proxy_url = os.environ.get("REFRESH_PROXY_URL", "").strip()
@@ -1533,13 +1535,15 @@ def render() -> str:
 
 def main() -> None:
     DIST.mkdir(parents=True, exist_ok=True)
-    html = render()
+    # One timestamp shared by the page and the manifest
+    built_iso = pd.Timestamp.now(tz="UTC").isoformat()
+    html = render(built_iso)
     (DIST / "index.html").write_text(html, encoding="utf-8")
     # .nojekyll keeps GitHub Pages from running Jekyll on the artifact
     (DIST / ".nojekyll").write_text("", encoding="utf-8")
     # Tiny manifest the page polls to detect a newer deploy without hitting the GitHub API
     (DIST / "build.json").write_text(json.dumps({
-        "built": pd.Timestamp.now(tz="UTC").isoformat(),
+        "built": built_iso,
         "commit": os.environ.get("GITHUB_SHA", "local")[:7],
     }), encoding="utf-8")
     print(f"Wrote {DIST / 'index.html'} ({len(html):,} bytes)")

@@ -260,7 +260,7 @@ def build_day_of_week_charts(tickets: pd.DataFrame) -> str:
     <p class="caption">Left: which event-days draw the biggest crowds — informs new-event scheduling. Right: which days customers actually buy — informs ad spend timing and posting cadence.</p>"""
 
 
-def build_monthly_revenue_chart(tickets: pd.DataFrame, months: int = 13) -> str:
+def build_monthly_revenue_chart(tickets: pd.DataFrame, months: int = 18) -> str:
     """Month-over-month ticket revenue, counted when the ticket was SOLD.
 
     Sale date, not event date: this answers "how much money came in each month", so a
@@ -280,8 +280,9 @@ def build_monthly_revenue_chart(tickets: pd.DataFrame, months: int = 13) -> str:
 
     # A month with no sales is a real zero, not a gap — reindex so the axis stays continuous
     span = pd.period_range(by_month["month"].min(), by_month["month"].max(), freq="M")
-    by_month = (by_month.set_index("month").reindex(span, fill_value=0)
-                        .rename_axis("month").reset_index().tail(months))
+    monthly_full = (by_month.set_index("month").reindex(span, fill_value=0)
+                            .rename_axis("month").reset_index())
+    by_month = monthly_full.tail(months)
 
     this_month = pd.Timestamp.now(tz="US/Pacific").to_period("M")
     is_partial = by_month["month"] == this_month
@@ -326,15 +327,19 @@ def build_monthly_revenue_chart(tickets: pd.DataFrame, months: int = 13) -> str:
         head = (f"<div><span class='mom-value'>{money(last['revenue'])}</span>"
                 f"<span class='mom-label'>{last['month'].strftime('%B %Y')} · "
                 f"{int(last['tickets']):,} tickets</span></div>")
-        if len(complete) >= 2:
-            prev = complete.iloc[-2]
-            if prev["revenue"] > 0:
-                pct = (last["revenue"] - prev["revenue"]) / prev["revenue"] * 100
-                up = pct >= 0
-                head += (f"<div class='mom-delta {'up' if up else 'down'}'>"
-                         f"{'▲' if up else '▼'} {abs(pct):,.0f}% vs {prev['month'].strftime('%B')}</div>")
-            else:
-                head += "<div class='mom-delta flat'>— no sales the month before</div>"
+        # Year over year, not month over month: events move between months, so comparing
+        # October to September mostly measures the calendar, not the business.
+        prior = monthly_full[monthly_full["month"] == last["month"] - 12]
+        prior_label = (last["month"] - 12).strftime("%B %Y")
+        if not prior.empty and prior.iloc[0]["revenue"] > 0:
+            base = prior.iloc[0]["revenue"]
+            pct = (last["revenue"] - base) / base * 100
+            up = pct >= 0
+            head += (f"<div class='mom-delta {'up' if up else 'down'}'>"
+                     f"{'▲' if up else '▼'} {abs(pct):,.0f}% vs {prior_label}</div>")
+        else:
+            head += (f"<div class='mom-delta flat' title='Ticket history starts Oct 2025'>"
+                     f"no {prior_label} to compare</div>")
 
     partial_note = ""
     if is_partial.any():

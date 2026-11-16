@@ -967,6 +967,8 @@ def render() -> str:
     unified_summary = unified_marketing_summary(tickets, attributed_ads, attributed_posts)
 
     updated = pd.Timestamp.now(tz="US/Pacific").strftime("%B %d, %Y at %-I:%M %p PT")
+    # ISO timestamp for the client-side staleness banner (the page cannot know "now" at build time)
+    built_iso = pd.Timestamp.now(tz="UTC").isoformat()
 
     if tickets.empty:
         return f"<html><body><h1>OTT Ticketing Dashboard</h1><p>No data yet. Updated {updated}.</p></body></html>"
@@ -1288,6 +1290,10 @@ def render() -> str:
                 padding: 12px; margin-bottom: 16px; }}
   .note {{ background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px;
            padding: 12px 14px; font-size: 13px; color: #92400e; margin: 14px 0; }}
+  .stale-banner {{ display: none; margin: 0 0 18px; padding: 12px 16px; background: #fef2f2;
+                   border: 1px solid #fecaca; border-left: 4px solid #dc2626; border-radius: 8px;
+                   color: #991b1b; font-size: 13px; line-height: 1.55; }}
+  .stale-banner a {{ color: #991b1b; font-weight: 700; }}
   .empty {{ color: #94a3b8; font-style: italic; }}
   footer {{ max-width: 1200px; margin: 0 auto; padding: 0 40px 40px;
             color: #94a3b8; font-size: 12px; }}
@@ -1301,7 +1307,7 @@ def render() -> str:
       <div class="updated">Auto-updated {updated} &nbsp;·&nbsp; data from SweatPals</div>
     </div>
     <div style="text-align:right">
-      <a class="refresh-btn" href="https://github.com/gabrielgalarza-create/ott-ticketing-analytics/actions/workflows/deploy.yml"
+      <a class="refresh-btn" href="https://github.com/gabrielgalarza/ott-ticketing-analytics/actions/workflows/deploy.yml"
          target="_blank" rel="noopener" title="Opens GitHub Actions — click 'Run workflow' there to trigger a fresh sync + rebuild (~4 min)">
         ↻ Refresh data
       </a>
@@ -1310,6 +1316,13 @@ def render() -> str:
   </div>
 </header>
 <main>
+  <div class="stale-banner" id="stale-banner" data-built="{built_iso}">
+    &#9888; <strong>This data is stale.</strong> The dashboard last rebuilt
+    <span id="stale-age">a while ago</span>, so these numbers are out of date. The scheduled
+    build may have been disabled &mdash;
+    <a href="https://github.com/gabrielgalarza/ott-ticketing-analytics/actions/workflows/deploy.yml"
+       target="_blank" rel="noopener">open GitHub Actions</a> and click "Run workflow" to refresh.
+  </div>
   <div class="cards">{cards_html}</div>
 
   {recommendations_html}
@@ -1382,6 +1395,24 @@ def render() -> str:
     <tbody>{past_rows if past_rows else '<tr><td colspan=7 class=empty>No past events.</td></tr>'}</tbody>
   </table>
 </main>
+<script>
+// Show the stale banner when the page is more than 12h old (the cron runs every 6h, so
+// 12h means at least two builds were missed).
+(function () {{
+  var el = document.getElementById("stale-banner");
+  if (!el) return;
+  var builtAt = new Date(el.getAttribute("data-built")).getTime();
+  if (!builtAt) return;
+  var hours = (Date.now() - builtAt) / 3600000;
+  if (hours < 12) return;
+  var age = hours < 48
+    ? Math.round(hours) + " hours ago"
+    : Math.round(hours / 24) + " days ago";
+  var slot = document.getElementById("stale-age");
+  if (slot) slot.textContent = age;
+  el.style.display = "block";
+}})();
+</script>
 <footer>
   Generated from SweatPals API data. Aggregate metrics only — no personal attendee data is published.
 </footer>
